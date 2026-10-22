@@ -2,7 +2,7 @@
 """
 PiDog color finder: search for a color, stop and report it, optionally walk back.
 
-Run on the PiDog (from ~/pidog/examples):
+Run on the PiDog (from ~/Robot-Dog):
     sudo python3 find_color.py red              # look for red, report, stay put
     sudo python3 find_color.py blue --return    # ...then walk back to the start
     sudo python3 find_color.py any --return     # look for ANY of the known colors
@@ -15,8 +15,7 @@ reverse with each move undone (forward <-> backward, left <-> right). That is
 dead reckoning, so it lands NEAR the start, not exactly on it. Walking
 surfaces, battery and slipping all add error.
 
-NOTE: method and action names come from the PiDog/vilib examples. If one
-errors on your version, check ~/pidog/examples and tell me what it printed.
+
 """
 import json
 import sys
