@@ -104,7 +104,7 @@ def seen_stable(checks=5, delay=0.1):
 def look_for(colors):
     """Sweep the head. Returns (color, head_yaw) of the first hit, or None."""
     for yaw in HEAD_SWEEP:
-        my_dog.head_move([[yaw, 0, 0]], immediately=True, speed=80)
+        my_dog.head_move([[yaw, 0, 0]], immediately=True, speed=95)
         my_dog.wait_head_done()
         sleep(SETTLE_S)
         for color in colors:
@@ -112,7 +112,7 @@ def look_for(colors):
             sleep(SETTLE_S)
             if seen_stable():
                 return color, yaw
-    my_dog.head_move([[0, 0, 0]], immediately=True, speed=80)
+    my_dog.head_move([[0, 0, 0]], immediately=True, speed=95)
     my_dog.wait_head_done()
     return None
 
@@ -157,7 +157,7 @@ def go_back():
         check_tilt()
     moves.clear()
     my_dog.head_move([[0, 0, 0]], immediately=True, speed=80)
-    my_dog.do_action('sit', speed=50)
+    my_dog.do_action('sit', speed=95)
     wait_done()
     print('Back at the start. Done.')
 
@@ -192,7 +192,7 @@ def main():
     except Tipped:
         print('The dog tipped over! Stopping all movement.')
         try:
-            my_dog.do_action('lie', speed=40)
+            my_dog.do_action('lie', speed=95)
         except Exception:
             pass
     finally:
