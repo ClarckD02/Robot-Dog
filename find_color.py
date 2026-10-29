@@ -10,32 +10,36 @@ Run on the PiDog (from ~/Robot-Dog):
 Colors: red, orange, yellow, green, blue, purple (what vilib's detector knows).
 Live camera view: http://<PiDog IP>:9000/mjpg
 
-How "go back" works: every move is logged, and returning replays the log in
-reverse with each move undone (forward <-> backward, left <-> right). That is
-dead reckoning, so it lands NEAR the start, not exactly on it. Walking
+How it walks: like examples/3_patrol.py. Steps are queued ahead of time and
+the dog is never made to wait between them, so the gait flows from one step
+into the next instead of stopping and restarting. The camera and the distance
+sensor are checked while the legs keep moving. The dog only stops when it
+sees the color (then it looks around with its head to make sure) or when the
+search is over.
+
+How "go back" works: every finished step is logged, and returning replays the
+log in reverse with each move undone (forward <-> backward, left <-> right).
+That is dead reckoning, so it lands NEAR the start, not exactly on it. Walking
 surfaces, battery and slipping all add error.
-
-
 """
 import json
 import sys
-from time import sleep, strftime
+from time import sleep, strftime, time
 
 from pidog import Pidog
 from vilib import Vilib
 
 # ---- Tunable settings -------------------------------------------------
 KNOWN_COLORS = ['red', 'orange', 'yellow', 'green', 'blue', 'purple']
-HEAD_SWEEP = [-60, -30, 0, 30, 60]   # head yaw angles to look at (degrees)
+HEAD_SWEEP = [0, -30, 30, -60, 60]   # head yaw angles to check after a sighting
 SETTLE_S = 0.4                       # wait after changing head angle / color
 MIN_BLOB_WIDTH = 20                  # ignore color specks smaller than this (px)
-MAX_BODY_TURNS = 8                   # body turns per spot before walking on
-TURN_STEPS = 2                       # 'turn_left' steps per body turn
+SPIN_STEPS = 16                      # 'turn_left' steps to look all the way around
 MAX_LEGS = 3                         # how many times to walk on and search again
 WALK_STEPS = 3                       # 'forward' steps per leg
-OBSTACLE_CM = 25                     # don't walk forward if closer than this
-TURN_SPEED = 95                      # use whatever speed value kept your dog stable
-WALK_SPEED = 95
+OBSTACLE_CM = 25                     # turn instead of walking if closer than this
+SPEED = 98                           # same speed as 3_patrol.py, for every move
+AHEAD = 2                            # steps kept queued so the legs never stop
 RESULT_FILE = 'found_color.json'
 # --------------------------------------------------------------------------
 
@@ -44,7 +48,7 @@ INVERSE = {'forward': 'backward', 'backward': 'forward',
 
 my_dog = Pidog()
 sleep(0.1)
-moves = []   # every body move taken: (action, step_count)
+moves = []   # every finished body move: [action, step_count]
 
 
 def wait_done():
@@ -60,19 +64,81 @@ def check_tilt():
     """Stop if the body is tipped way over. Per SunFounder's IMU docs, ax is ~ -1g
     (-16384) when level, so a small |ax| means the dog is on its side or back."""
     try:
-        ax, _, _ = my_dog.accData
+        ax, ay, az = my_dog.accData
     except Exception:
         return  # no IMU reading, can't judge
+    if ax == ay == az == 0:
+        return  # IMU has not sent a reading yet
     if abs(ax) < 9000:
         raise Tipped()
 
 
-def move(action, steps):
-    speed = WALK_SPEED if action in ('forward', 'backward') else TURN_SPEED
-    my_dog.do_action(action, step_count=steps, speed=speed)
-    wait_done()
-    moves.append((action, steps))
-    check_tilt()
+def log_move(action):
+    if moves and moves[-1][0] == action:
+        moves[-1][1] += 1
+    else:
+        moves.append([action, 1])
+
+
+class Walker:
+    """Feeds steps into PiDog's leg queue without waiting in between, like
+    3_patrol.py does, and keeps track of which steps have actually finished."""
+
+    def __init__(self):
+        self.frames = {}    # action -> frames in one step
+        self.pending = []   # queued (action, tag) steps not yet finished, oldest first
+
+    def _frames(self, action):
+        if action not in self.frames:
+            self.frames[action] = len(my_dog.actions_dict[action][0])
+        return self.frames[action]
+
+    def _sync(self):
+        """Move finished steps from pending into the move log."""
+        left = len(my_dog.legs_action_buffer)
+        done = sum(self._frames(a) for a, _ in self.pending) - left
+        while self.pending and self._frames(self.pending[0][0]) <= done:
+            done -= self._frames(self.pending[0][0])
+            log_move(self.pending.pop(0)[0])
+
+    def update(self):
+        with my_dog.legs_thread_lock:
+            self._sync()
+
+    def queued(self):
+        return len(self.pending)
+
+    def add(self, action, tag=None):
+        """Queue one more step behind the ones already queued. The tag lets
+        the caller tell its own steps apart from others in the queue."""
+        self._frames(action)  # look this up before touching the queue
+        my_dog.do_action(action, step_count=1, speed=SPEED)
+        self.pending.append((action, tag))
+
+    def cut(self):
+        """Let the step in progress finish, drop the queued steps after it.
+        Returns the dropped (action, tag) steps."""
+        with my_dog.legs_thread_lock:
+            self._sync()
+            if len(self.pending) < 2:
+                return []
+            dropped = self.pending[1:]
+            keep = len(my_dog.legs_action_buffer) - sum(self._frames(a) for a, _ in dropped)
+            del my_dog.legs_action_buffer[max(keep, 0):]
+            self.pending = self.pending[:1]
+            return dropped
+
+    def stop(self):
+        """Finish the step in progress, then stand still. Returns dropped steps."""
+        dropped = self.cut()
+        while not my_dog.is_legs_done():
+            check_tilt()
+            sleep(0.01)
+        self.update()
+        return dropped
+
+
+walker = Walker()
 
 
 def set_color(color):
@@ -101,37 +167,118 @@ def seen_stable(checks=5, delay=0.1):
     return hits >= 3
 
 
-def look_for(colors):
-    """Sweep the head. Returns (color, head_yaw) of the first hit, or None."""
+class Spotter:
+    """Quick color check that runs while walking. With several colors it
+    switches to the next color each time the current one has had SETTLE_S
+    seconds to show up."""
+
+    def __init__(self, colors):
+        self.colors = colors
+        self.i = 0
+        self._switch(0)
+
+    def _switch(self, i):
+        self.i = i
+        set_color(self.colors[i])
+        self.since = time()
+
+    def check(self):
+        if time() - self.since < SETTLE_S:
+            return None
+        if color_visible():
+            return self.colors[self.i]
+        if len(self.colors) > 1:
+            self._switch((self.i + 1) % len(self.colors))
+        return None
+
+    def resume(self):
+        """Go back to cycling colors after a head-sweep check."""
+        self._switch(self.i)
+
+
+def look_for(color):
+    """Standing still, sweep the head. Returns head yaw where the color is, or None."""
+    set_color(color)
     for yaw in HEAD_SWEEP:
         my_dog.head_move([[yaw, 0, 0]], immediately=True, speed=95)
         my_dog.wait_head_done()
         sleep(SETTLE_S)
-        for color in colors:
-            set_color(color)
-            sleep(SETTLE_S)
-            if seen_stable():
-                return color, yaw
+        if seen_stable():
+            return yaw
     my_dog.head_move([[0, 0, 0]], immediately=True, speed=95)
     my_dog.wait_head_done()
     return None
 
 
-def search(colors):
-    for leg in range(MAX_LEGS + 1):
-        print(f'Searching from spot {leg + 1} of {MAX_LEGS + 1}...')
-        for _ in range(MAX_BODY_TURNS + 1):
-            hit = look_for(colors)
-            if hit:
-                return hit
-            move('turn_left', TURN_STEPS)
-        if leg < MAX_LEGS:
+def go(action, steps, spotter, avoid=False):
+    """Queue `steps` steps of `action` without stopping between them. While the
+    legs move, watch for the color and (if avoid) for obstacles. Returns
+    (color, head_yaw) on a confirmed sighting, else None once all steps are
+    queued, so the next call can add its steps behind them with no pause."""
+    tag = object()   # marks the steps this call queues
+    queued = 0
+    turns = 0
+    while queued < steps:
+        walker.update()
+        check_tilt()
+
+        if avoid:
             d = my_dog.read_distance()
             if 0 < d < OBSTACLE_CM:
-                print(f'Something is {d:.0f} cm ahead, turning instead of walking.')
-                move('turn_left', TURN_STEPS * 2)
-            else:
-                move('forward', WALK_STEPS)
+                if (action, tag) in walker.pending[1:]:
+                    print(f'Something is {d:.0f} cm ahead, turning instead of walking.')
+                    queued -= walker.cut().count((action, tag))
+                if walker.queued() < AHEAD:
+                    if turns >= SPIN_STEPS:
+                        print('Boxed in, giving up on this leg.')
+                        return None
+                    walker.add('turn_left')
+                    turns += 1
+            elif walker.queued() < AHEAD:
+                walker.add(action, tag)
+                queued += 1
+        elif walker.queued() < AHEAD:
+            walker.add(action, tag)
+            queued += 1
+
+        color = spotter.check()
+        if color:
+            print(f'Saw something {color}, stopping to check...')
+            queued -= walker.stop().count((action, tag))
+            yaw = look_for(color)
+            if yaw is not None:
+                return color, yaw
+            print('False alarm, moving on.')
+            spotter.resume()
+
+        sleep(0.01)
+    return None
+
+
+def search(colors):
+    spotter = Spotter(colors)
+    my_dog.rgb_strip.set_mode('breath', 'white', bps=0.5)
+    for leg in range(MAX_LEGS + 1):
+        print(f'Searching from spot {leg + 1} of {MAX_LEGS + 1}...')
+        hit = go('turn_left', SPIN_STEPS, spotter)
+        if hit:
+            return hit
+        if leg < MAX_LEGS:
+            hit = go('forward', WALK_STEPS, spotter, avoid=True)
+            if hit:
+                return hit
+    # all steps are queued; keep watching until the last one finishes
+    while not my_dog.is_legs_done():
+        check_tilt()
+        color = spotter.check()
+        if color:
+            walker.stop()
+            yaw = look_for(color)
+            if yaw is not None:
+                return color, yaw
+            spotter.resume()
+        sleep(0.01)
+    walker.update()
     return None
 
 
@@ -140,23 +287,26 @@ def report(color, yaw):
     with open(RESULT_FILE, 'w') as f:
         json.dump({'color': color, 'head_yaw': yaw,
                    'time': strftime('%Y-%m-%d %H:%M:%S'),
-                   'moves_from_start': len(moves)}, f)
+                   'moves_from_start': sum(n for _, n in moves)}, f)
     print(f'Saved to {RESULT_FILE}')
+    my_dog.rgb_strip.set_mode('boom', 'green', bps=1)
     my_dog.head_move([[yaw, 0, 0]], immediately=True, speed=80)
     my_dog.do_action('wag_tail', step_count=5, speed=95)
     my_dog.speak('single_bark_1')
-    wait_done()
+    my_dog.wait_all_done()
 
 
 def go_back():
     print('Walking back to the start (approximate)...')
-    for action, steps in reversed(list(moves)):
-        my_dog.do_action(INVERSE[action], step_count=steps,
-                         speed=WALK_SPEED if action in ('forward', 'backward') else TURN_SPEED)
-        wait_done()
-        check_tilt()
-    moves.clear()
     my_dog.head_move([[0, 0, 0]], immediately=True, speed=80)
+    my_dog.rgb_strip.set_mode('breath', 'white', bps=0.5)
+    # queue the whole trip at once so the legs never stop between moves
+    for action, steps in reversed(moves):
+        my_dog.do_action(INVERSE[action], step_count=steps, speed=SPEED)
+    while not my_dog.is_legs_done():
+        check_tilt()
+        sleep(0.01)
+    moves.clear()
     my_dog.do_action('sit', speed=95)
     wait_done()
     print('Back at the start. Done.')
@@ -173,10 +323,12 @@ def main():
     colors = KNOWN_COLORS if target == 'any' else [target]
 
     Vilib.camera_start(vflip=False, hflip=False)
-    Vilib.display(local=True, web=True)
+    Vilib.display(local=False, web=True)
     sleep(0.5)
-    my_dog.do_action('stand', speed=50)
-    wait_done()
+    # same start as 3_patrol.py
+    my_dog.do_action('stand', speed=80)
+    my_dog.wait_all_done()
+    sleep(0.5)
     print(f'Looking for: {target}' + ('  (will return to start)' if want_return else ''))
 
     try:
@@ -192,6 +344,7 @@ def main():
     except Tipped:
         print('The dog tipped over! Stopping all movement.')
         try:
+            my_dog.body_stop()
             my_dog.do_action('lie', speed=95)
         except Exception:
             pass
